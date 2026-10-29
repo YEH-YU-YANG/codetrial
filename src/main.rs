@@ -351,7 +351,7 @@ fn run_web(options: CliOptions) -> Result<(), String> {
     // Why that socket is carried here rather than rebound: `serve_setup`. Read
     // once, so the question and the page it opens answer from the same map.
     let before_config = environment_and_flags(&options);
-    exit_when_stdin_closes();
+    let launched_as_child = exit_when_stdin_closes();
     data_dir_config_from_environment(&options, is_production(&before_config))?;
     let handed_over = if is_cold_start(&options, &before_config) {
         Some(serve_setup(&before_config, &options)?)
@@ -416,8 +416,21 @@ fn run_web(options: CliOptions) -> Result<(), String> {
     if let Some(refusal) = published_secret_refusal(&values, bound) {
         return Err(refusal);
     }
+    let setup = codetrial::web::SetupContext::new(
+        primary_config_path(&options)?,
+        values.clone(),
+        bound,
+        !launched_as_child,
+        config.trusted_proxy_hops,
+    )?;
     // Same reason `serve_setup` prints this: say where to go.
     println!("codetrial: open http://{bound} in your browser");
+    if let Some(setup) = &setup {
+        println!(
+            "codetrial: to change keys at http://{bound}/setup, enter {}",
+            setup.code()
+        );
+    }
 
     // Past every startup check, so whatever a previous run left in the log is
     // no longer true. Written on failure and removed on none, the file outlives
@@ -466,7 +479,7 @@ fn run_web(options: CliOptions) -> Result<(), String> {
             });
             axum::serve(
                 listener,
-                codetrial::web::web_service_with_dispatcher(config, dispatcher),
+                codetrial::web::web_service_with_setup(config, dispatcher, setup),
             )
             .await
         })
@@ -735,11 +748,14 @@ fn web_error_log_path(options: &CliOptions) -> std::path::PathBuf {
 /// reads no configuration there, because this is not configuration: it is the
 /// launcher describing the pipe it handed over, and it has to hold while Setup
 /// serves, before any config file exists.
-fn exit_when_stdin_closes() {
+///
+/// Returns whether it does, which is whether a program started this server as
+/// its child.
+fn exit_when_stdin_closes() -> bool {
     if !codetrial::config::exit_with_stdin(
         std::env::var("CODETRIAL_EXIT_WITH_STDIN").ok().as_deref(),
     ) {
-        return;
+        return false;
     }
     std::thread::spawn(|| {
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
@@ -750,6 +766,7 @@ fn exit_when_stdin_closes() {
         let _ = writeln!(std::io::stderr(), "standard input closed: exiting");
         std::process::exit(0);
     });
+    true
 }
 
 fn run_livekit(config: AgentConfig, room_name: &str) -> Result<(), String> {

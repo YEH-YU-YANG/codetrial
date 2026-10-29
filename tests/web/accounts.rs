@@ -1478,7 +1478,8 @@ async fn every_owner_scoped_route_refuses_an_anonymous_request() {
 
     // Routes that answer without a session. The two LiveKit paths belong here
     // because they authenticate a signed machine principal against a room
-    // rather than a person against a cookie.
+    // rather than a person against a cookie, and Change keys because it asks
+    // for the code its launch printed instead.
     let anonymous = [
         "/healthz",
         "/api/token",
@@ -1487,6 +1488,8 @@ async fn every_owner_scoped_route_refuses_an_anonymous_request() {
         "/api/session",
         "/api/logout",
         "/runtime-config.js",
+        "/setup",
+        "/api/setup",
         codetrial::recording::WEBHOOK_ROUTE,
         codetrial::recording::REPLAY_ROUTE,
     ];
