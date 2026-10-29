@@ -445,15 +445,25 @@ fn windows_replacement_is_owner_only_in_a_folder_everyone_can_read() {
     .owner()
     .unwrap()
     .to_string();
+
+    // A DACL as its flags and its entries. Windows sets flags of its own, such
+    // as `AI`, so of those only `P`, protected, is asserted.
+    let split = |sddl: std::ffi::OsString| {
+        let sddl = sddl.to_string_lossy().into_owned();
+        let (flags, entries) = sddl.split_once('(').unwrap();
+        (flags.to_string(), format!("({entries}"))
+    };
     let dacl = |target: &Path| {
-        GetNamedSecurityInfo(
-            target,
-            SeObjectType::SE_FILE_OBJECT,
-            SecurityInformation::Dacl,
+        split(
+            GetNamedSecurityInfo(
+                target,
+                SeObjectType::SE_FILE_OBJECT,
+                SecurityInformation::Dacl,
+            )
+            .unwrap()
+            .as_sddl()
+            .unwrap(),
         )
-        .unwrap()
-        .as_sddl()
-        .unwrap()
     };
     let protect = |target: &Path, sddl: String| {
         let descriptor: LocalBox<SecurityDescriptor> = sddl.parse().unwrap();
@@ -475,15 +485,19 @@ fn windows_replacement_is_owner_only_in_a_folder_everyone_can_read() {
         format!("D:P(A;OICI;FA;;;{owner})(A;OICI;FR;;;WD)"),
     );
     protect(&path, format!("D:P(A;;FA;;;{owner})"));
-    assert!(dacl(&scratch.0).to_string_lossy().contains(";WD)"));
+    assert!(dacl(&scratch.0).1.contains(";WD)"));
 
     replace_file(&path, "LIVEKIT_API_KEY=new\n").unwrap();
-    let owner_only = format!("D:P(A;;FA;;;{owner})")
-        .parse::<LocalBox<SecurityDescriptor>>()
-        .unwrap()
-        .as_sddl()
-        .unwrap();
-    assert_eq!(dacl(&path), owner_only);
+    let (_, owner_only) = split(
+        format!("D:P(A;;FA;;;{owner})")
+            .parse::<LocalBox<SecurityDescriptor>>()
+            .unwrap()
+            .as_sddl()
+            .unwrap(),
+    );
+    let (flags, entries) = dacl(&path);
+    assert!(flags.contains('P'), "{flags}");
+    assert_eq!(entries, owner_only);
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
         "LIVEKIT_API_KEY=new\n"
