@@ -57,8 +57,13 @@ fn merging_rewrites_only_the_replaced_keys() {
     crate::config::apply_config_file(&mut values, crate::config::parse_config(&merged).unwrap());
     assert_eq!(crate::config::google_api_keys(&values).unwrap(), ["google"]);
 
-    // An unterminated last line is ended before an appended one, and a blank
-    // replacement for a key the file does not set adds nothing.
+    // An unterminated last line is ended before an appended one, an empty file
+    // gets no blank line ahead of its first, and a blank replacement for a key
+    // the file does not set adds nothing.
+    assert_eq!(
+        merge("", &[("LIVEKIT_API_KEY", "new")]),
+        "LIVEKIT_API_KEY=new\n"
+    );
     assert_eq!(
         merge(
             "LIVEKIT_URL=wss://old.example",
@@ -130,14 +135,12 @@ async fn livekit() -> (String, tokio::task::JoinHandle<()>) {
     (url, task)
 }
 
-/// Starts no interviewer, and answers whether one is running with `idle`.
-struct Dispatcher {
-    idle: bool,
-}
+/// Starts no interviewer and is never running one.
+struct Idle;
 
-impl RoomDispatcher for Dispatcher {
+impl RoomDispatcher for Idle {
     fn is_idle(&self) -> bool {
-        self.idle
+        true
     }
 
     fn supports_guest_admission(&self) -> bool {
@@ -338,7 +341,7 @@ async fn change_keys_answers_only_its_loopback_host_and_code() {
 #[tokio::test]
 async fn a_save_writes_only_the_new_keys_and_this_process_keeps_the_old_ones() {
     let (livekit, _livekit) = livekit().await;
-    let server = Server::start(&livekit, Some(Arc::new(Dispatcher { idle: true }))).await;
+    let server = Server::start(&livekit, Some(Arc::new(Idle))).await;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -412,10 +415,23 @@ async fn a_save_with_nothing_to_change_or_keys_that_fail_leaves_the_file() {
     assert_eq!(server.summary().await["restartPending"], false);
 }
 
+/// Says nothing about whether an interview is running, so it keeps the
+/// trait's answer.
+struct Unknown;
+
+impl RoomDispatcher for Unknown {
+    fn ensure_agent(&self, _: &str, _: &Provider) -> Result<(), super::super::DispatchRefusal> {
+        Ok(())
+    }
+}
+
+/// A save waits until no interview is running, and a dispatcher that cannot
+/// tell is taken to have one. `LocalDispatcher` can, and how it counts its
+/// rooms is tested in `tests/unit/dispatch.rs`.
 #[tokio::test]
-async fn a_running_interview_refuses_the_save() {
+async fn a_dispatcher_that_cannot_rule_out_an_interview_refuses_the_save() {
     let (livekit, _livekit) = livekit().await;
-    let server = Server::start(&livekit, Some(Arc::new(Dispatcher { idle: false }))).await;
+    let server = Server::start(&livekit, Some(Arc::new(Unknown))).await;
     let (status, _) = server
         .save(json!({
             "code": server.code,
