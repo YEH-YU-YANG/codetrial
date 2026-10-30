@@ -110,11 +110,19 @@ fn only_a_standalone_loopback_launch_without_a_proxy_may_change_keys() {
 /// A LiveKit project that takes `NEW_KEY` and `NEW_SECRET` and nothing else,
 /// checked through the crate's own verifier.
 async fn livekit() -> (String, tokio::task::JoinHandle<()>) {
+    livekit_calling(|| {}).await
+}
+
+/// `livekit`, running `meanwhile` while a probe waits for its answer.
+async fn livekit_calling(
+    meanwhile: impl Fn() + Clone + Send + Sync + 'static,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let router = axum::Router::new().route(
         "/twirp/livekit.RoomService/ListRooms",
-        axum::routing::post(|headers: HeaderMap| async move {
+        axum::routing::post(move |headers: HeaderMap| async move {
+            meanwhile();
             let token = headers
                 .get(header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
@@ -453,6 +461,38 @@ async fn a_dispatcher_that_cannot_rule_out_an_interview_refuses_the_save() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
     server.unchanged();
+}
+
+/// The file is compared again once the keys are checked, which can take
+/// seconds, so an edit saved meanwhile is kept and the save refused.
+#[tokio::test]
+async fn an_edit_saved_while_the_keys_are_checked_is_kept() {
+    let config = Arc::new(std::sync::OnceLock::<PathBuf>::new());
+    let (livekit, _livekit) = livekit_calling({
+        let config = config.clone();
+        move || {
+            if let Some(path) = config.get() {
+                let contents = std::fs::read_to_string(path).unwrap();
+                std::fs::write(path, contents.replace("keep-session", "edited-session")).unwrap();
+            }
+        }
+    })
+    .await;
+    let server = Server::start(&livekit, Some(Arc::new(Idle))).await;
+    config.set(server.path.clone()).unwrap();
+    let (status, error) = server
+        .save(json!({
+            "code": server.code,
+            "livekitApiKey": NEW_KEY,
+            "livekitApiSecret": NEW_SECRET,
+        }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(
+        std::fs::read_to_string(&server.path).unwrap(),
+        server.contents.replace("keep-session", "edited-session")
+    );
+    assert_eq!(std::fs::read_dir(&server.scratch.0).unwrap().count(), 1);
 }
 
 #[cfg(windows)]

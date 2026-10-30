@@ -166,13 +166,23 @@ impl SetupContext {
             return refusal;
         }
 
-        // Last, because an interview can start while the probes run.
+        // Last, because an interview can start and the file can be edited while
+        // the probes run, which can take seconds.
         if dispatcher.is_some_and(|dispatcher| !dispatcher.is_idle()) {
             return json_response(
                 StatusCode::CONFLICT,
                 json!({
                     "error": "An interview is running on this server or still writing its report. \
                               Save again once it has ended."
+                }),
+            );
+        }
+        if regular_file(&self.path).as_deref() != Some(self.contents.as_str()) {
+            return json_response(
+                StatusCode::CONFLICT,
+                json!({
+                    "error": "The config file changed while the new keys were being checked. \
+                              Restart the server before changing keys again."
                 }),
             );
         }
