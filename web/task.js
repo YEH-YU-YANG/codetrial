@@ -1205,7 +1205,7 @@ function countdown(verdict) {
     Math.ceil((task.rules.lookAwaySeconds * 1000 - verdict.awayMs) / 1000),
   );
   $("countdown").textContent =
-    `Face the screen: the attempt ends in ${left} seconds.`;
+    `Face the screen: the attempt ends in ${left} second${left === 1 ? "" : "s"}.`;
   $("countdown").hidden = false;
   try {
     beepContext ??= new AudioContext();

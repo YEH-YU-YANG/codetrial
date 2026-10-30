@@ -1316,7 +1316,12 @@ test("looking down past the calibration warns, counts down and then ends", async
       /ends in \d seconds/,
     );
     assert.deepEqual(await ended(page), []);
-    await page.clock.runFor(3000);
+    await page.clock.runFor(1500);
+    assert.equal(
+      await page.locator("#countdown").textContent(),
+      "Face the screen: the attempt ends in 1 second.",
+    );
+    await page.clock.runFor(1500);
     assert.deepEqual(await ended(page), [["invalid", "look_away"]]);
   } finally {
     await page.close();
