@@ -1,7 +1,7 @@
 # Change keys screenshots
 
 Screenshots for "Reopen Setup for local web credential changes". Before is
-upstream main at 2d1e059 and after is 553620a, both taken in Chromium at
+upstream main at 38d53a7 and after is 2fed302, both taken in Chromium at
 1280x800 on a standalone loopback launch.
 
 Every value on these pages is a fixture: LiveKit points at
