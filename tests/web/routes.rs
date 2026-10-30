@@ -284,6 +284,8 @@ fn router_routes_match_a_fixed_allowlist() {
     let mut allowed = vec![
         "/healthz",
         "/runtime-config.js",
+        "/setup",
+        "/api/setup",
         "/api/token",
         "/api/task-reviews/{room}",
         "/api/task-sets/{set_id}/tasks/{task_id}",
