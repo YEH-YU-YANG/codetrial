@@ -375,7 +375,7 @@ fn run_web(options: CliOptions) -> Result<(), String> {
     // Why that socket is carried here rather than rebound: `serve_setup`. Read
     // once, so the question and the page it opens answer from the same map.
     let before_config = environment_and_flags(&options);
-    codetrial::exit_when_stdin_closes();
+    let launched_as_child = codetrial::exit_when_stdin_closes();
     data_dir_config_from_environment(&options, is_production(&before_config))?;
     let handed_over = if is_cold_start(&options, &before_config) {
         Some(serve_setup(&before_config, &options)?)
@@ -440,8 +440,21 @@ fn run_web(options: CliOptions) -> Result<(), String> {
     if let Some(refusal) = published_secret_refusal(&values, bound) {
         return Err(refusal);
     }
+    let setup = codetrial::web::SetupContext::new(
+        primary_config_path(&options)?,
+        values.clone(),
+        bound,
+        !launched_as_child,
+        config.trusted_proxy_hops,
+    )?;
     // Same reason `serve_setup` prints this: say where to go.
     println!("codetrial: open http://{bound} in your browser");
+    if let Some(setup) = &setup {
+        println!(
+            "codetrial: to change keys at http://{bound}/setup, enter {}",
+            setup.code()
+        );
+    }
 
     // Task mode is off unless `--task-mode` asks for it. It serves the learner
     // at this machine and nobody else: it holds decrypted reference solutions
@@ -514,7 +527,7 @@ fn run_web(options: CliOptions) -> Result<(), String> {
             });
             axum::serve(
                 listener,
-                codetrial::web::web_service_with_dispatcher(config, dispatcher),
+                codetrial::web::web_service_with_setup(config, dispatcher, setup),
             )
             .await
         })

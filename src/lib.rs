@@ -74,11 +74,14 @@ pub fn exe_dir() -> std::path::PathBuf {
 /// reads no configuration there, because this is not configuration: it is the
 /// launcher describing the pipe it handed over, and it has to hold while Setup
 /// serves, before any config file exists.
-pub fn exit_when_stdin_closes() {
+///
+/// Returns whether it does, which is whether a program started this server as
+/// its child.
+pub fn exit_when_stdin_closes() -> bool {
     use std::io::Write as _;
 
     if !config::exit_with_stdin(std::env::var("CODETRIAL_EXIT_WITH_STDIN").ok().as_deref()) {
-        return;
+        return false;
     }
     std::thread::spawn(|| {
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
@@ -89,6 +92,7 @@ pub fn exit_when_stdin_closes() {
         let _ = writeln!(std::io::stderr(), "standard input closed: exiting");
         std::process::exit(0);
     });
+    true
 }
 
 /// Writes a new file that only its owner can read, and refuses rather than
