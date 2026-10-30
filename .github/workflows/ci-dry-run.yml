@@ -1,0 +1,1210 @@
+# Rust compilation shares one target directory; independent gates run beside it.
+# All lanes use scripts/test.sh, whose default still runs the complete gate.
+name: check dry run
+
+on:
+  push:
+    branches: [verify/ci-dry-run]
+
+permissions:
+  contents: read
+
+# A second push to a branch makes the first run's answer worthless, so stop
+# paying for it. Never on main: those runs are the record of what passed.
+#
+# The event is in the group so a weekly avatar run on main never queues behind,
+# or displaces, the push run that publishes a release.
+concurrency:
+  group: check-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  DRY_RUN_BASE: 3bbbcf5d924bfb22ececc82ca2543d71f810b225
+  # Every build here is a link-bound build: eleven test binaries between 29 and
+  # 84 MB, each statically linking libwebrtc. Two settings attack that, and both
+  # pay twice because the mutation gate rebuilds once per mutant.
+  #
+  # Debug info is the larger half and was measured: touching one file and
+  # relinking the suite took 16.6s with full debug and 9.9s with
+  # line-tables-only, a 40% cut per mutant. `line-tables-only` rather than `0`
+  # keeps file and line in a CI backtrace, which is the only part of debug info
+  # a failed run here actually uses.
+  #
+  # mold replaces the linker itself. It is the tool built for this shape of
+  # problem, many large static inputs, and it is an apt package on this image.
+  #
+  # Both change the build fingerprint, which is why the cargo cache key hashes
+  # them (restore-cargo-cache says how). Without that, a cache saved under the
+  # old flags would be restored forever and rebuilt from scratch every run,
+  # which is worse than having no cache at all.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  RUSTFLAGS: -Clink-arg=-fuse-ld=mold
+
+  # One source for the pin: the release tag and the source install it falls
+  # back to, in .github/actions/install-mutants.
+  CARGO_MUTANTS_VERSION: 27.1.0
+
+  # Pinned for the same reason as the one above: a linter that moves under you
+  # turns an unrelated push red, and the fix is then a version bump nobody chose
+  # to make. Kept in step with whatever contributors run locally, which is
+  # whatever `ruff` is on their PATH; the gate skips rather than fails when they
+  # have none.
+  RUFF_VERSION: 0.15.2
+
+  # The workflow's own linter, pinned like the tools above. Installed rather
+  # than assumed: `scripts/test.sh` skips this gate when the binary is absent,
+  # and absent is what it was here, so the file that describes every other
+  # check was the one file nothing checked.
+  ACTIONLINT_VERSION: 1.7.12
+  # scripts/hook-check would install git hooks into each runner's checkout and
+  # fail the build over them. Nobody commits here, and the commit-log step
+  # replays every message the hooks would have judged.
+  CODETRIAL_SKIP_HOOKS: 1
+
+  # The license and source policy in deny.toml, pinned like the tools above:
+  # a release that reads that file differently should arrive as a bump.
+  CARGO_DENY_VERSION: 0.20.2
+
+jobs:
+  audit:
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install cargo-audit
+        uses: ./.github/actions/install-audit
+      - name: Audit the tested merge or main
+        env:
+          EVENT: ${{ github.event_name }}
+          GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          case "$EVENT" in
+            push)
+              python3 scripts/audit.py --base "$DRY_RUN_BASE"
+              ;;
+            pull_request)
+              base=$(git rev-parse HEAD^1)
+              python3 scripts/audit.py --base "$base"
+              ;;
+            merge_group)
+              git cat-file -e "$GROUP_BASE^{commit}" || git fetch --no-tags --depth=1 origin "$GROUP_BASE"
+              python3 scripts/audit.py --base "$GROUP_BASE"
+              ;;
+            *) exit 2 ;;
+          esac
+
+  gates:
+    name: gates (${{ matrix.lane }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        # What each lane installs, so a gate never skips for a missing tool.
+        # sqlite3 is for a Rust test of the retention script; shellcheck and
+        # shfmt are the shell gates' optional tools. Only the Rust lane links,
+        # so only it installs mold for the workflow's RUSTFLAGS.
+        #
+        # `timeout` is each lane's wedge detector: against the six-hour default
+        # it catches a job that has stopped making progress, which is all it is
+        # for. The browser lane gets far less than the cargo build, because
+        # Node bounds each test file too, but a job can also stall during
+        # dependency installation before the test runner starts.
+        include:
+          - lane: rust
+            timeout: 45
+            # One apt transaction for both crates; all desktop dependencies
+            # remain required even when a change only touches the server.
+            packages: libglib2.0-dev mold sqlite3 libwebkit2gtk-4.1-dev libxdo-dev libssl-dev librsvg2-dev
+          - lane: portable
+            timeout: 20
+            packages: shellcheck shfmt
+          # Browser suites are the critical path: with two slices the slower
+          # one spent 374s in the gates. Three runners keep the per-runner
+          # concurrency bounded while spreading independent files.
+          # BROWSER_SHARD partitions by size (see scripts/test.sh).
+          - lane: browser
+            shard: 1/3
+            timeout: 20
+          - lane: browser
+            shard: 2/3
+            timeout: 20
+          - lane: browser
+            shard: 3/3
+            timeout: 20
+    # Pinned rather than `ubuntu-latest`: that label moves to a new image on
+    # GitHub's schedule, which turns an unrelated morning into a debugging
+    # session. Bumping this is a commit somebody chose to make.
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout }}
+    steps:
+      # A pull request follows its head branch, so one opened from a fork's
+      # main takes in every later push there, and the contributor cannot start
+      # a second change until it merges. The pre-push hook refuses that push;
+      # this refuses the pull request of a contributor who never installed the
+      # hooks. Ahead of the checkout, because it needs nothing from the tree.
+      # The branch name is read in the condition only and never reaches a
+      # shell, because a fork chooses it.
+      - name: Refuse a pull request from a fork's main
+        if: >-
+          github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name != github.repository
+          && github.event.pull_request.head.ref == 'main'
+        run: |
+          echo "This pull request is opened from the main branch of a fork." >&2
+          echo "Push the commits to a topic branch and open a new pull request from it." >&2
+          exit 1
+
+      # The commit-message check needs every commit in the pull request. The
+      # other lanes read only HEAD, which build.rs records, so they skip the
+      # history.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: ${{ matrix.lane != 'portable' && 1 || 0 }}
+          persist-credentials: false
+
+      # The commit-msg hook binds whoever installed it. This binds everyone
+      # else: a rebase, an amend, `--no-verify`, or a subject typed into the
+      # GitHub merge box all reach the branch unread otherwise. It runs the same
+      # script the pre-push hook runs, so a contributor with hooks and a
+      # contributor without are judged by one list.
+      #
+      # Pull requests only, and deliberately. `base.sha..HEAD` is the work being
+      # proposed, which is the thing these rules are about. The push event's
+      # range is not: a merge to main replays every commit of the merged branch,
+      # so a rule this log only started following recently would reject history
+      # rather than the change in front of it.
+      #
+      # First among the steps that read the tree, because it costs a second and
+      # the rest of this job costs minutes.
+      - name: Check the commit messages
+        if: matrix.lane == 'portable'
+        env:
+          BASE_SHA: ${{ env.DRY_RUN_BASE }}
+        run: |
+          set -euo pipefail
+
+          # An unfetched base is not an empty range. Say which one this is
+          # rather than reporting "nothing to check" for a check that could not
+          # run.
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "base commit $BASE_SHA is not in this checkout" >&2
+            exit 1
+          fi
+          git rev-list "$BASE_SHA..HEAD" | python3 scripts/check-secrets.py --commits
+          git rev-list --no-merges "$BASE_SHA..HEAD" | ./scripts/check-commit-log.sh
+
+      - name: Reclaim runner disk
+        if: matrix.lane == 'rust'
+        uses: ./.github/actions/reclaim-disk
+
+      - name: Install system packages
+        if: matrix.packages
+        uses: ./.github/actions/apt-install
+        with:
+          packages: ${{ matrix.packages }}
+      - name: Install WebRTC C++ compiler
+        if: matrix.lane == 'rust'
+        uses: ./.github/actions/webrtc-clang
+
+      # rust-toolchain.toml names the release, and clippy and rustfmt with it;
+      # this installs that one rather than whatever the runner image carries.
+      # The browser lane runs no cargo at all.
+      - name: Install Rust
+        if: matrix.lane != 'browser'
+        run: rustup toolchain install
+
+      # Restore and save are separate steps on purpose. `actions/cache` saves
+      # from a post-job step that is skipped unless the job succeeded, so a run
+      # that built the whole dependency graph and then failed one test threw the
+      # build away and made the next run pay for it again. That is not
+      # hypothetical here: nothing saved a cache between 21 and 26 August while
+      # runs failed on disk and were superseded by pushes, so every run in that
+      # window restored a five-day-old target/ and rebuilt the difference, which
+      # is most of why the gates took twelve minutes.
+      - name: Restore cargo cache
+        if: matrix.lane == 'rust'
+        id: cargo-cache
+        uses: ./.github/actions/restore-cargo-cache
+
+      # The desktop crate's cache key: the cargo cache's compilers and flags,
+      # under a name of its own and with its own lockfile.
+      - name: Compute the desktop cache key
+        if: matrix.lane == 'rust'
+        id: desktop
+        env:
+          CARGO_PREFIX: ${{ steps.cargo-cache.outputs.prefix }}
+          INPUTS: ${{ hashFiles('desktop/Cargo.lock') }}
+        run: |
+          prefix="desktop-${CARGO_PREFIX#cargo-}"
+          echo "prefix=$prefix" >>"$GITHUB_OUTPUT"
+          echo "key=$prefix$INPUTS" >>"$GITHUB_OUTPUT"
+
+      # The desktop crate's build, in an entry of its own. The cargo cache is
+      # also what every mutation shard restores, and a path added to it would
+      # be a gigabyte of WebKit bindings each shard downloads and never reads.
+      - name: Restore desktop cargo cache
+        id: desktop-cache
+        if: matrix.lane == 'rust'
+        uses: actions/cache/restore@v6
+        with:
+          path: target/desktop
+          key: ${{ steps.desktop.outputs.key }}
+          restore-keys: ${{ steps.desktop.outputs.prefix }}
+
+      # Every lane fetches and verifies these bytes; only the portable lane
+      # saves them, below, so three lanes do not race to write one key.
+      - name: Restore vendored bytes
+        id: vendor
+        uses: ./.github/actions/restore-vendor
+
+      # The npm install itself is not cached. It is 90 packages now that eslint
+      # is here, but they are small and pure JavaScript, and the step runs in
+      # seconds against a cargo build that runs in minutes. A cache round trip
+      # would not show up next to that.
+      #
+      # `npm ci`, not `npm install`: eslint's transitive dependencies are caret
+      # ranges, so an install resolves them fresh on every run and the gate that
+      # passed yesterday is not the gate running today. The exact pins in
+      # package.json only cover the four direct dependencies.
+      - name: Install node dependencies
+        run: npm ci
+
+      # Both browser-driving lanes restore Chromium; the browser lane saves it,
+      # below.
+      - name: Install Chromium
+        if: matrix.lane != 'portable'
+        id: chromium
+        uses: ./.github/actions/chromium
+
+      - name: Place the instructor packaging environment
+        if: matrix.lane == 'portable'
+        run: |
+          # Outside target/, which is cached: a restored venv would keep a
+          # package the requirements file has since dropped.
+          # The gate sets it up there itself, through the same path the
+          # instructor tool takes.
+          echo "CODETRIAL_TASK_TOOLS=$RUNNER_TEMP/task-tools" >> "$GITHUB_ENV"
+
+      # The Python here generates the problem bank and drives two integration
+      # harnesses, and `ruff check` is its only linter. The gate skips when the
+      # binary is missing, which is right on a laptop and wrong here. pipx is on
+      # the image and installs into its own environment, so this does not fight
+      # the runner's externally-managed Python.
+      - name: Install ruff
+        if: matrix.lane == 'portable'
+        run: pipx install "ruff==$RUFF_VERSION"
+
+      # commentflow settles comment width, which no other formatter here does:
+      # rustfmt leaves a short-wrapped comment short and shfmt does not touch
+      # comment text at all. The indent gate skips its reflow lane when the
+      # binary is missing, which is right on a laptop and wrong here, so it is
+      # installed ahead of the gate.
+      #
+      # It ships as a release binary rather than an apt package, and its only
+      # tag is a rolling "latest", so the version is not frozen: a republished
+      # "latest" is picked up silently. That is tolerable here and nowhere
+      # else in this job. Comment reflow is a formatting gate, so the failure
+      # mode is a diff in the indent check rather than a wrong binary running
+      # against the tree, and that diff is what surfaces it.
+      - name: Install commentflow
+        if: matrix.lane == 'portable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          ./scripts/install-release-binary.sh sysprog21/commentflow latest
+          commentflow-x86_64-unknown-linux-gnu.tar.gz commentflow
+
+      - name: Install cargo-deny
+        if: matrix.lane == 'rust'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          ./scripts/install-release-binary.sh EmbarkStudios/cargo-deny
+          "$CARGO_DENY_VERSION"
+          "cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          "cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl/cargo-deny"
+
+      # Pinned to a tag rather than tracking a rolling one, unlike commentflow
+      # above: this one judges the workflow, so a linter that moves on its own
+      # turns an unrelated push red.
+      - name: Install actionlint
+        if: matrix.lane == 'portable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          ./scripts/install-release-binary.sh rhysd/actionlint
+          "v$ACTIONLINT_VERSION"
+          "actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" actionlint
+
+      # A pull request Dependabot opened and wrote has its formatting drift
+      # reported rather than failed (scripts/test.sh says why). The opener
+      # cannot be forged, unlike a commit's author; the commits are still read,
+      # so a person's commit on the branch is held to the drift. The range runs
+      # to the pull request's head rather than the merge ref, so a person's
+      # merge into the branch counts as theirs. Every other event gets no range
+      # and stays strict. Main has no merge queue yet, so nothing after this
+      # stops the drift landing: the indent gate reads the whole tree, and the
+      # push to main and every later pull request fail on it until it is fixed.
+      - name: Run gates
+        env:
+          BROWSER_SHARD: ${{ matrix.shard }}
+          INDENT_ADVISORY_RANGE: >-
+            ${{ github.event_name == 'pull_request'
+            && github.event.pull_request.user.login == 'dependabot[bot]'
+            && format('{0}..{1}', github.event.pull_request.base.sha,
+            github.event.pull_request.head.sha) || '' }}
+        shell: bash
+        run: |
+          status=0
+          ./scripts/test.sh "${{ matrix.lane }}" 2>&1 | tee "$RUNNER_TEMP/gates.log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            lines=$({ grep -E 'failed gates|FAILED|FAIL |^not ok|panicked at|^error|drift' "$RUNNER_TEMP/gates.log" || true; } | head -60 | sed 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')
+            echo "::error title=gates ${{ matrix.lane }} failed::$lines"
+          fi
+          exit "$status"
+
+      # A merge group runs on a queue ref that is deleted once it lands, and a
+      # cache saved there is visible to no other ref, so none of the saves below
+      # run for one.
+      #
+      # After the gates pass, so the bytes saved are bytes verify-vendor
+      # accepted. Under the restore step's key: hashing the tree now would also
+      # hash what the fetch added, and no later restore would ask for that key.
+      - name: Save vendored bytes
+        if: github.event_name != 'merge_group' && matrix.lane == 'portable' && steps.vendor.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: web/vendor
+          key: ${{ steps.vendor.outputs.key }}
+      - name: Save Chromium
+        if: github.event_name != 'merge_group' && matrix.lane == 'browser' && steps.chromium.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ steps.chromium.outputs.key }}
+
+      # The release job makes the same comparison, but only after a merge: a
+      # `build.rs` that stops recording the commit would pass every pull
+      # request and turn the publishing leg red instead. Only after the gates
+      # pass: a failed build leaves the binary the cache restored, and its
+      # version would name some earlier commit.
+      - name: Prove the build names its commit
+        if: matrix.lane == 'rust'
+        run: |
+          version=$(target/debug/codetrial --version)
+          head=$(git rev-parse HEAD)
+          [[ $version == *"(${head::7})" ]] \
+            || { echo "build reports \"$version\", not ${head::7}" >&2; exit 1; }
+
+      # Its own step, not part of `cargo test`. It drives a real browser through
+      # the offline interview and is hermetic now, with the Compiler Explorer
+      # calls intercepted, but it still fails on a two minute navigation timeout
+      # when the machine is busy: `cargo test` is what people run while doing
+      # something else, and a gate that goes red for being run at a bad moment
+      # teaches everyone to ignore red. A dedicated runner has no such
+      # contention, so this is where it can be trusted.
+      #
+      # browser-check.sh exits 3 when Playwright is missing and the test skips
+      # on that. Chromium is installed above, so a skip here means the install
+      # step silently did nothing and is worth chasing.
+      - name: Run the browser interview check
+        if: matrix.lane == 'rust'
+        run: cargo test --locked --test web -- --ignored browser_check_accepts_running_rust_server_offline_interview
+
+      # Last, and not conditional on the gates passing. An exact key hit has
+      # nothing new to store; anything else is a build worth keeping whatever
+      # the gates decided about the code. `cancelled()` is excluded because a
+      # superseded run is killed mid-step and has nothing coherent to save.
+      #
+      # Main only, for these two. A cache saved on a pull request is readable
+      # by that pull request alone, and the two entries are 2.4 GB between
+      # them: against a 10 GB repository limit that was full, one lockfile
+      # change on a branch evicted the entries every other branch restores.
+      # A pull request that changes the lockfile still starts from main's tree
+      # through the restore key and rebuilds only what moved.
+      - name: Save cargo cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && matrix.lane == 'rust' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            !target/desktop
+          key: ${{ steps.cargo-cache.outputs.key }}
+
+      - name: Save desktop cargo cache
+        if: >-
+          ${{ !cancelled() && github.ref == 'refs/heads/main'
+              && matrix.lane == 'rust'
+              && steps.desktop-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: target/desktop
+          key: ${{ steps.desktop.outputs.key }}
+
+  # The one status: every gate lane and audit passed, and on a PR the mutation
+  # plan and every shard did too. Planning only runs on pull requests, and the
+  # shards only after a plan that found mutants, so a skipped shard job after a
+  # successful plan means the plan counted none. A push or a merge group plans
+  # nothing, so it is answered as soon as the lanes finish.
+  #
+  # `!cancelled()` rather than `always()`: a run superseded by a newer push has
+  # nothing to report, while a lane or shard that failed or timed out still
+  # reaches this job and fails it. Not on a schedule or a dispatch, which run
+  # no gates.
+  check:
+    needs: [gates, audit, plan-mutants, mutants]
+    if: ${{ !cancelled() && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every gate lane and mutation shard
+        env:
+          GATES: ${{ needs.gates.result }}
+          AUDIT: ${{ needs.audit.result }}
+          PLAN: ${{ needs.plan-mutants.result }}
+          MUTANTS: ${{ needs.mutants.result }}
+        run: |
+          if [ "$GATES" != success ]; then
+            echo "::error::gate lanes: $GATES. This job only collects them; the failed gates lane has the cause."
+            exit 1
+          fi
+          if [ "$AUDIT" != success ]; then
+            echo "::error::security audit: $AUDIT. See the audit job for new vulnerabilities or an incomplete scan."
+            exit 1
+          fi
+          case "$MUTANTS/$PLAN" in
+            success/success | skipped/success | skipped/skipped) ;;
+            *) echo "::error::mutants: $MUTANTS (plan: $PLAN)"; exit 1 ;;
+          esac
+
+  # How many shards the diff is worth, decided before any of them start.
+  #
+  # A fixed width optimises for the outlier and taxes the common case: four
+  # runners each paying six minutes of setup to test two mutants is worse than
+  # one runner testing eight. `--list` parses the tree without building it, one
+  # second here, so the count is cheap to ask for and the width can follow it.
+  #
+  # One shard per 25 mutants, under the ceiling the step explains. The ceiling
+  # is not about arithmetic: past it the setup cost of another runner stops
+  # paying for itself against the mutants it would take.
+  #
+  # A pull request from a fork's main is refused in `gates`, and this job does
+  # not wait on that one, so it repeats the condition rather than plan and fan
+  # out shards for a pull request that has already failed.
+  plan-mutants:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # This job builds nothing but the tool, and only when the prebuilt
+      # binary cannot be had, so the workflow-wide mold flag would make it
+      # install a linker it has no use for. Cleared here rather than
+      # installing mold to satisfy a flag.
+      RUSTFLAGS: ""
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      width: ${{ steps.plan.outputs.width }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A workflow, browser or documentation change has no Rust mutants. Detect
+      # that before installing the toolchain and the mutation tool.
+      - name: Read the Rust diff
+        id: diff
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git diff "$DRY_RUN_BASE...HEAD" -- '*.rs' >"$RUNNER_TEMP/pr.diff"
+          if [ -s "$RUNNER_TEMP/pr.diff" ]; then
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust
+        if: steps.diff.outputs.changed == 'true'
+        run: rustup toolchain install
+
+      - name: Install cargo-mutants
+        if: steps.diff.outputs.changed == 'true'
+        uses: ./.github/actions/install-mutants
+
+      - name: Count the mutants this diff is worth
+        id: plan
+        run: |
+          # The default shell is `bash -e` with no pipefail, so the status of a
+          # pipeline is the last command's. Without this, a cargo-mutants that
+          # died would leave count at zero from `wc`, the shard job would skip
+          # on `count != '0'`, and the pull request would go green having
+          # mutation-tested nothing. The list goes to a file first so "cargo
+          # said zero" and "cargo failed" cannot look alike.
+          set -o pipefail
+          count=0
+          if [ -s "$RUNNER_TEMP/pr.diff" ]; then
+            cargo mutants --list --in-diff "$RUNNER_TEMP/pr.diff" >"$RUNNER_TEMP/list.txt"
+            count=$(wc -l <"$RUNNER_TEMP/list.txt" | tr -d ' ')
+          fi
+          width=$(( (count + 24) / 25 ))
+          [ "$width" -lt 1 ] && width=1
+
+          # The ceiling is a runner budget, not a target. Twenty-five mutants a
+          # shard is what the line above asks for and what fits the job's
+          # timeout; a ceiling of four turned a 764-mutant diff into 191 a
+          # shard, which is seven times the design load and forty-five minutes
+          # of work reported as nothing at all. Sixteen did the same to a diff
+          # that adds a whole subsystem: every shard ran out of its budget
+          # before reporting. Forty-eight keeps the design load up to twelve
+          # hundred mutants; shards beyond the account's concurrent jobs queue
+          # rather than fail.
+          [ "$width" -gt 48 ] && width=48
+          {
+            echo "count=$count"
+            echo "width=$width"
+            echo "shards=$(seq 0 $((width - 1)) | jq -R . | jq -sc .)"
+          } >>"$GITHUB_OUTPUT"
+          echo "$count mutants over $width shard(s)" >>"$GITHUB_STEP_SUMMARY"
+
+  # Mutation testing, beside the gates rather than behind them.
+  #
+  # `cargo test` proves the tests pass. This proves they can fail. The gap it
+  # closes is not hypothetical: the CODE_SETTLE gate in livekit.rs shipped with
+  # its whole predicate revertible to a constant and every Rust test still
+  # green, because the one test naming the constant had been edited to step
+  # around it rather than exercise it.
+  #
+  # Scoped to the diff, not the crate. The crate is 1840 mutants and hours of
+  # runner time, and a mutant surviving in code this branch never touched is
+  # somebody else's gap reported at the worst possible moment. Scoped this way
+  # the cost tracks the change.
+  #
+  # Sharded because that cost is not bounded by anything else here. A 34-file
+  # refactor produced 98 mutants at roughly 35s each, an hour of one runner,
+  # which overran the ceiling and told nobody how far it had got. Four shards
+  # divide the mutants between them, so each finishes in about a quarter of the
+  # time and each reports its own count and progress. `fail-fast: false` so one
+  # shard finding a surviving mutant does not cancel the other three and hide
+  # the rest of the answer.
+  #
+  # Pull requests only. A push to main has already merged; the question this
+  # asks is what a change failed to test, and that is worth answering while the
+  # change can still be edited.
+  mutants:
+    needs: plan-mutants
+    # No mutants means no runners. A docs-only or JS-only pull request should
+    # not start a job to discover it has nothing to do.
+    if: needs.plan-mutants.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Zero-indexed, and it has to stay that way. cargo-mutants slices the
+        # list as "the first n/k on shard 0", so a one-based matrix silently
+        # drops every mutant in the first slice and runs an empty last one: on
+        # a 101-mutant diff that was 75 tested, four green shards, and nothing
+        # anywhere saying a quarter of it went unexamined. The plan job emits
+        # zero-based indices; check that per-shard counts sum to the unsharded
+        # total before trusting any change here.
+        shard: ${{ fromJson(needs.plan-mutants.outputs.shards) }}
+    steps:
+      # Full history: the shard diffs against the base branch, and a shallow
+      # clone has no merge base to diff from.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reclaim runner disk
+        uses: ./.github/actions/reclaim-disk
+
+      - name: Install native build dependency
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libglib2.0-dev mold sqlite3
+      - name: Install WebRTC C++ compiler
+        uses: ./.github/actions/webrtc-clang
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      # Restore, never save. The gates job owns this cache; four shards writing
+      # a 1 GB entry under one key would be four uploads for the copy that
+      # happens to finish last. Restoring a prior lockfile's artifacts is what
+      # keeps each shard's baseline build incremental rather than cold, which is
+      # the whole reason `--in-place` is worth using.
+      - name: Restore cargo cache
+        uses: ./.github/actions/restore-cargo-cache
+
+      # Needed even though no browser runs here: a Rust test serves the
+      # fetched MediaPipe binaries and asserts their content types, and
+      # cargo-mutants runs the real suite once per mutant.
+      - name: Restore vendored bytes
+        uses: ./.github/actions/restore-vendor
+
+      - name: Fetch any vendored bytes the cache did not have
+        run: ./scripts/fetch-vendor.sh
+
+      - name: Install cargo-mutants
+        uses: ./.github/actions/install-mutants
+
+      # `--in-place` because cargo-mutants otherwise copies the tree and builds
+      # it from cold, discarding the target/ the cache above just restored. The
+      # runner is disposable, so a dirtied tree costs nothing. It is also why
+      # the shards are separate runners rather than `--jobs`: target/ is tens of
+      # gigabytes, so a build directory per job does not fit.
+      #
+      # The mutant list is printed before the run. cargo-mutants draws progress
+      # with a terminal bar that renders as nothing in a log, so without this a
+      # shard looks identical whether it is working or wedged.
+      - name: Mutation-test the diff
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          SHARD: ${{ matrix.shard }}/${{ needs.plan-mutants.outputs.width }}
+        run: |
+          git diff "$DRY_RUN_BASE...HEAD" -- '*.rs' >"$RUNNER_TEMP/pr.diff"
+          echo "::group::Mutants in shard $SHARD"
+          cargo mutants --list --in-diff "$RUNNER_TEMP/pr.diff" \
+            --shard "$SHARD" \
+            | tee "$RUNNER_TEMP/shard.txt"
+          echo "::endgroup::"
+          echo "shard $SHARD: \
+            $(wc -l <"$RUNNER_TEMP/shard.txt") mutants" >>"$GITHUB_STEP_SUMMARY"
+          # Bounded here rather than only by `timeout-minutes`, because a job
+          # the runner kills is reported as "Cancelled after 45m", which reads
+          # in the checks list exactly like a human cancelling it or a newer
+          # push superseding it. This budget is below the job's, so an overrun
+          # is this step failing with a line saying what overran.
+          #
+          # SIGINT and not SIGKILL: cargo-mutants stops on it and writes what
+          # it had, which the upload below keeps.
+          # `|| status=$?` and not an `if`, because the shell is `bash -e` and
+          # the exit status of an `if` whose branch did not run is zero: the
+          # overrun would be swallowed by the construct meant to report it.
+          status=0
+          timeout --signal=INT --kill-after=60s 35m \
+            cargo mutants --in-place --in-diff "$RUNNER_TEMP/pr.diff" \
+            --shard "$SHARD" \
+            || status=$?
+          if [ "$status" -eq 124 ]; then
+            # The shard's size, not what is left: the list is the assignment
+            # made before the run, and cargo-mutants reports progress only in
+            # the summary it never got to print. The artifact below is what
+            # says how far it got.
+            assigned=$(wc -l <"$RUNNER_TEMP/shard.txt" | tr -d ' ')
+            echo "::error::shard ${SHARD%/*} ran out of its 35m budget; it was assigned $assigned mutants. Not a surviving mutant: give plan-mutants a higher shard ceiling, or raise both timeouts."
+          fi
+          exit "$status"
+
+      # An overrun or a surviving mutant both leave the answer in mutants.out,
+      # and the log carries none of it: cargo-mutants prints one summary line
+      # at the end and nothing before it. Without this a timed-out shard cannot
+      # say how far it got.
+      - name: Report surviving mutants
+        if: failure()
+        shell: bash
+        run: |
+          for kind in missed timeout; do
+            [ -s "mutants.out/$kind.txt" ] || continue
+            lines=$(head -40 "mutants.out/$kind.txt" | sed 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')
+            echo "::error title=$kind mutants::$lines"
+          done
+
+      - name: Keep what the shard managed to test
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out
+          if-no-files-found: ignore
+
+  # The release is a binary, not a directory beside a binary: `rust-embed`
+  # compiles `web/` (including its WASM) into it. Native runners avoid a
+  # cross-platform linker or packaging toolchain.
+  #
+  # Beside `gates` and `audit`, not behind them. A build publishes nothing: its
+  # archives reach a user only through `release`, which waits on the lanes, so
+  # starting the legs early cannot ship a commit the gates rejected. Waiting
+  # put four to seven minutes of build on the end of every push to main, and on
+  # a red main it spent them anyway. Nothing is lost by running them together:
+  # they share no cache with the lanes, and the vendored bytes are fetched
+  # again on the leg that finds none.
+  build:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: ${{ matrix.name }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            # Keep this major.minor aligned with Cargo.toml's rust-version.
+            image: rust:1.98.0-bullseye
+            glibc: '2.31'
+            glibcxx: '3.4.28'
+            extension: ''
+            archive: tar.gz
+          - name: macOS arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            extension: ''
+            archive: zip
+          - name: Windows x86_64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            extension: .exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    env:
+      # Override the workflow-wide Linux-only mold flag with the
+      # platform-specific flags required by each release target. Neither
+      # non-Linux runner can use mold, and MSVC hands -fuse-ld=mold to link.exe,
+      # which fails with LNK1117. Releases build once per push rather than once
+      # per mutant, so using the platform's default linker is the right trade.
+      #
+      # Even an empty RUSTFLAGS overrides .cargo/config.toml, so Apple targets
+      # must repeat -ObjC here or the linker omits WebRTC's NSString categories
+      # and the first room aborts.
+      RUSTFLAGS: >-
+        ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-C target-feature=+crt-static'
+            || contains(matrix.target, '-apple-') && '-Clink-arg=-ObjC'
+            || '' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Every target is its runner's host, so the pinned toolchain already has
+      # its standard library.
+      - name: Install Rust
+        run: rustup toolchain install
+      # The image is part of the key, because on this leg it is the compiler.
+      # `rust-cache` keys on the runner's rustc, which is no longer the one that
+      # builds here, and it declines to save when an exact key hit came back: a
+      # `target/` filled by the old runner build therefore survives under this
+      # key indefinitely. Let the container's rustc match the runner's once, and
+      # cargo would call those objects fresh and link glibc 2.39 C objects into
+      # a Bullseye binary. Naming the image keeps each compiler's artifacts in
+      # its own entry, and bumping the pin rotates the cache with it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}${{ matrix.image && format('-{0}', matrix.image) || '' }}
+      # The same entry the gates job saves, on the same key. Without it all
+      # three platform legs re-download 24 MB that one job already fetched and
+      # stored on this commit, and the fetch script no-ops on a hit.
+      - name: Prepare browser assets for embedding
+        uses: ./.github/actions/prepare-vendor
+      # The device sign-in task mode uses needs a GitHub OAuth App's client
+      # ID compiled in. It is public, not a secret; a repository without the
+      # variable builds a release with no device sign-in, which says so.
+      - name: Build the self-contained executable
+        if: runner.os != 'Linux'
+        env:
+          CODETRIAL_GITHUB_CLIENT_ID: ${{ vars.CODETRIAL_GITHUB_CLIENT_ID }}
+        run: cargo build --release --locked -p codetrial --target ${{ matrix.target }}
+      # GitHub retired the Ubuntu 20.04 runner, but its glibc 2.31 remains the
+      # useful Linux release baseline. Build inside Bullseye, which carries the
+      # same glibc, rather than on the runner. This is deliberately not musl:
+      # the archive stays an ordinary dynamically linked Linux executable.
+      #
+      # The image pin in the matrix is the one thing here that has to be
+      # maintained by hand. Every other leg compiles with the release
+      # rust-toolchain.toml pins, so this is the only compiler in the workflow
+      # that can fall behind the one the gates ran, and it runs on push to main
+      # alone: an API newer than `rust-version` compiles in the pull request and
+      # breaks the leg that publishes, after the merge. It is the floor, so bump
+      # it together with `rust-version`, which scripts/test.sh checks.
+      #
+      # `--user` rather than the container's root. Root here writes root-owned
+      # objects into the mounted workspace, `Swatinem/rust-cache` then hits
+      # EACCES pruning them, and it swallows that error at debug level: the
+      # cache silently keeps a multi-gigabyte unpruned `target/` and evicts the
+      # entries the gates depend on.
+      #
+      # No `apt-get`, which is what leaves nothing here needing root. The base
+      # image already carries `libglib2.0-dev`, and reaching for Debian's
+      # mirrors at build time would buy a scheduled outage: bullseye is past
+      # its LTS window and moves to archive.debian.org on someone else's
+      # timetable, which `Acquire::Check-Valid-Until=false` does not answer. A
+      # base image that ever drops glib fails loudly at pkg-config.
+      #
+      # `RUSTUP_TOOLCHAIN` because the image's rustup would otherwise obey
+      # rust-toolchain.toml in the mounted checkout, download the gates' newer
+      # release and build with it, and this leg would stop testing the floor.
+      # The image names its own release in `RUST_VERSION`.
+      #
+      # `CARGO_HOME` is the runner's, mounted in. It is what the cache restored
+      # a step ago, and the container cannot see it otherwise: without this
+      # every release re-downloads the registry and the prebuilt libwebrtc.
+      - name: Install Linux WebRTC C++ compiler
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/webrtc-clang
+      - name: Build Linux executable against the compatibility baseline
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CODETRIAL_GITHUB_CLIENT_ID: ${{ vars.CODETRIAL_GITHUB_CLIENT_ID }}
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --volume "$HOME/.cargo:/cargo" \
+            --volume "$RUNNER_TEMP/clang:/clang:ro" \
+            --workdir /workspace \
+            --env CARGO_HOME=/cargo \
+            --env CXX=/clang/bin/clang++ \
+            --env GITHUB_SHA \
+            --env CODETRIAL_GITHUB_CLIENT_ID \
+            ${{ matrix.image }} \
+            sh -c 'RUSTUP_TOOLCHAIN=${RUST_VERSION:?} exec cargo build --release --locked -p codetrial --target "$1"' \
+            sh ${{ matrix.target }}
+      # A successful link does not prove the Objective-C categories survived.
+      # The selector reference remains even when its implementation is absent,
+      # so match a method name entry rather than any occurrence of the selector.
+      #
+      # A relative method list names its selector through a slot in
+      # __objc_selrefs, and the otool in the runner's Xcode cannot follow that
+      # slot: it prints "(0x1037c3988 extends past end of file)" where a newer
+      # one prints the name. Look the slot up in the selref table, which every
+      # otool decodes, and accept a method entry that points at it.
+      - name: Verify macOS WebRTC linkage
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          binary=target/${{ matrix.target }}/release/codetrial
+          sel=stringForAbslStringView:
+          # Collect the output so awk and grep cannot give otool SIGPIPE under
+          # pipefail.
+          selrefs=$(otool -v -s __DATA __objc_selrefs "$binary")
+          slot=$(awk -v want="__TEXT:__objc_methname:$sel" \
+            '$2 == want { sub(/^0+/, "", $1); print $1 }' <<< "$selrefs")
+          objc=$(otool -oV "$binary")
+          grep -Eq "^[[:space:]]*name[[:space:]]+0x[0-9a-f]+ (\(0x${slot:-none}[ )]|$sel\$)" <<< "$objc" \
+            || { echo 'WebRTC NSString category is missing' >&2; exit 1; }
+      # Two libraries can set the floor, not one. WebRTC carries Chromium's
+      # libc++ statically, so today nothing asks for libstdc++ and GLIBCXX_ is
+      # absent; a dependency that links it again would raise that requirement
+      # whether or not it touches GLIBC_, and a binary refused for either
+      # reason is refused the same way: in the loader, before main. So GLIBC_
+      # must be present and GLIBCXX_ is held to its ceiling only when it is.
+      # The pattern reads numeric versions only, which is what leaves a name
+      # like GLIBC_ABI_DT_RELR out: it is a marker, not a version to compare.
+      - name: Verify Linux release compatibility
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          binary=target/${{ matrix.target }}/release/codetrial
+          # Not `readelf | grep -q`. A `shell: bash` step runs under pipefail,
+          # `grep -q` closes the pipe at its first match, and a producer whose
+          # output does not fit the pipe buffer then dies of SIGPIPE and takes
+          # the pipeline's status with it: the check would fail here on a
+          # binary that passes it. A dynamic section is small enough today that
+          # it never fires, which is the worst size for a trap to be.
+          grep -qF 'Shared library: [libc.so.6]' <<< "$(readelf -d "$binary")" \
+            || { echo 'Linux release is not dynamically linked to glibc' >&2; exit 1; }
+          floor() {
+            required=$(LC_ALL=C readelf -W --version-info "$binary" \
+              | sed -nE "s/.*Name: $1_([0-9.]+)[[:space:]]+Flags:.*/\1/p" \
+              | sort -V | tail -n 1)
+            if [ -z "$required" ]; then
+              [ "${3:-}" = optional ] && return 0
+              echo "Linux release has no $1 symbol requirement" >&2
+              exit 1
+            fi
+            newest=$(printf '%s\n%s\n' "$required" "$2" | sort -V | tail -n 1)
+            [ "$newest" = "$2" ] \
+              || { echo "Linux release requires $1_$required, not $1_$2 or older" >&2; exit 1; }
+          }
+          floor GLIBC '${{ matrix.glibc }}'
+          floor GLIBCXX '${{ matrix.glibcxx }}' optional
+      # The symbol table says the binary asks for nothing newer; this says the
+      # loader agrees. Every other step that runs it runs it on the runner,
+      # whose glibc is 2.39, where the failure in issue #30 cannot reproduce.
+      # `--help` is the whole test: a binary that needs a newer glibc never
+      # reaches main to print it.
+      - name: Prove the Linux release starts on the baseline userland
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --workdir /workspace \
+            debian:bullseye-slim \
+            ./target/${{ matrix.target }}/release/codetrial --help
+      # The only place the embed is exercised as an embed. `rust-embed` matches
+      # keys exactly in release and reads the same names off the filesystem in
+      # debug, so every test binary the suite builds resolves these paths
+      # through the kernel instead, and normalization bugs are invisible to all
+      # of them. Run from an empty directory, so a fallback to disk cannot
+      # answer and make a missing embed look present.
+      - name: Prove the binary serves without a web tree
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          empty=$(mktemp -d)
+          cp target/${{ matrix.target }}/release/codetrial "$empty/"
+          # `web` refuses to start without a primary config file, so the empty
+          # directory gets one. It is still empty of a web tree, which is the
+          # only emptiness this step is about.
+          printf '%s\n' \
+            'LIVEKIT_URL=wss://example.livekit.cloud' \
+            'LIVEKIT_API_KEY=embed-check-key' \
+            'LIVEKIT_API_SECRET=embed-check-secret' >"$empty/codetrial.env.local"
+          # Killed from a trap rather than only on the happy path, and with its
+          # output redirected: a server left running past a failed probe holds
+          # the step's stdout open, which turns a one-line failure into a job
+          # that sits until the 45-minute timeout.
+          trap 'pkill -f "codetrial web" || true' EXIT
+          (cd "$empty" && CODETRIAL_WEB_ADDR=127.0.0.1:18999 ./codetrial web >server.log 2>&1 &)
+          for _ in $(seq 1 30); do
+            curl -fs -o /dev/null http://127.0.0.1:18999/ && break
+            sleep 1
+          done
+          status() { curl -sS -o /dev/null -w '%{http_code}' --path-as-is "http://127.0.0.1:18999$1"; }
+          title() { curl -sS --path-as-is "http://127.0.0.1:18999$1" | tr -d '\n' | sed -n 's|.*<title>\(.*\)</title>.*|\1|p'; }
+          # The wasm is last because it is the one the fetch supplies rather
+          # than git: it fails here if the vendored bytes never reached
+          # `.rodata`. The doubled separator is second-to-last because only a
+          # release binary matches embedded keys exactly, so this is the only
+          # place normalization is observable.
+          for probe in / /interview /vendor/avatar/three-vrm.js \
+                       //vendor/avatar/three-vrm.js /vendor/pyodide/pyodide.asm.wasm; do
+            code=$(status "$probe")
+            [ "$code" = 200 ] || { echo "embedded $probe answered $code, not 200" >&2; exit 1; }
+          done
+          voice_type=$(curl -fsS -o "$empty/test-voice.wav" -w '%{content_type}' \
+            http://127.0.0.1:18999/audio/test-voice.wav)
+          [ "$voice_type" = audio/wav ] \
+            || { echo "embedded test voice has type $voice_type, not audio/wav" >&2; exit 1; }
+          cmp web/audio/test-voice.wav "$empty/test-voice.wav"
+          [ "$(status /.git/config)" = 404 ] \
+            || { echo "a dotfile was served" >&2; exit 1; }
+
+          # Status is not enough for this one. `web/recording/index.html` is a
+          # nested index, so a resolver that fails to normalize the trailing
+          # slash does not 404: it exhausts its own candidates and falls back
+          # to the root index, answering 200 with the wrong page. Only the
+          # release binary can show it, because a debug build resolves the
+          # embed through the filesystem, where the kernel collapses the
+          # separator whatever the resolver does.
+          for probe in /recording /recording/ //recording/; do
+            found=$(title "$probe")
+            [ "$found" = "CodeTrial - Recording" ] \
+              || { echo "$probe served \"$found\", not the recording page" >&2; exit 1; }
+          done
+          # No backslash probe here. This runner is Linux, where a backslash is
+          # an ordinary filename byte, so the traversal spelling 404s whether or
+          # not the resolver refuses it: the check cannot fail and would only
+          # read as coverage. `normalization_cannot_launder_a_refused_path`
+          # owns that case, asserting the refusal itself rather than an outcome
+          # the platform supplies for free.
+      # The checkout is the source this binary was compiled from, so its HEAD
+      # is the commit the binary must name. In CI the build takes that commit
+      # from `GITHUB_SHA` rather than from git, and every test reads back
+      # whatever the build recorded, so asking git is what notices a build
+      # that recorded `unknown`, a bad truncation, or another commit. Seven
+      # characters is the width `build.rs` prints.
+      - name: Prove the release names its commit
+        shell: bash
+        run: |
+          binary=target/${{ matrix.target }}/release/codetrial${{ matrix.extension }}
+          version=$("$binary" --version)
+          head=$(git rev-parse HEAD)
+          [[ $version == *"(${head::7})" ]] \
+            || { echo "release reports \"$version\", not ${head::7}" >&2; exit 1; }
+
+      - name: Name release asset
+        run: >-
+          cp target/${{ matrix.target }}/release/codetrial${{ matrix.extension }}
+          codetrial-${{ matrix.target }}${{ matrix.extension }}
+        shell: bash
+      - name: Compress Linux release asset
+        if: runner.os == 'Linux'
+        shell: bash
+        run: tar -czf codetrial-${{ matrix.target }}.tar.gz codetrial-${{ matrix.target }}
+      # `zip`, not `ditto`. `--keepParent` keeps the parent *directory* of what
+      # it is given, and what it is given here is a file, so the archive carried
+      # `codetrial/codetrial-aarch64-apple-darwin`: the runner's checkout
+      # directory name, leaked into a download, with the binary a level deeper
+      # than the other two platforms put it. ditto also writes an AppleDouble
+      # `._` sidecar that is noise everywhere it is unpacked.
+      #
+      # Nothing is lost by dropping it: the ad-hoc signature the linker applies
+      # lives inside the Mach-O, not in the extended attributes ditto exists to
+      # preserve, and it survives a zip round trip along with the mode bits.
+      - name: Compress macOS release asset
+        if: runner.os == 'macOS'
+        shell: bash
+        run: zip -q -9 codetrial-${{ matrix.target }}.zip codetrial-${{ matrix.target }}
+      - name: Compress Windows release asset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -LiteralPath codetrial-${{ matrix.target }}.exe -DestinationPath codetrial-${{ matrix.target }}.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: codetrial-${{ matrix.target }}
+          path: codetrial-${{ matrix.target }}.${{ matrix.archive }}
+
+  # One rolling release for the current main build. GitHub releases require a
+  # tag; `latest` avoids exposing an implementation SHA as a release name.
+  # desktop.yml's `rolling` job repeats this swap for `desktop-latest`.
+  release:
+    needs: [gates, audit, build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: release-latest
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: codetrial-*
+          path: dist
+          merge-multiple: true
+      - name: Verify and publish the latest release
+        shell: bash
+        run: |
+          assets=(
+            dist/codetrial-x86_64-unknown-linux-gnu.tar.gz
+            dist/codetrial-aarch64-apple-darwin.zip
+            dist/codetrial-x86_64-pc-windows-msvc.zip
+          )
+          for asset in "${assets[@]}"; do
+            [ -f "$asset" ] || { echo "missing release asset: $asset" >&2; exit 1; }
+          done
+
+          tag=latest
+          # The attempt, not just the run: a re-run reuses GITHUB_RUN_ID, and
+          # `gh release create` fails outright on a leftover draft.
+          staged="staging-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+
+          # Upload to a draft first: a failed upload must not take the current
+          # public release down with it. Nothing else here looks for a draft,
+          # so it collects itself on the way out, including on the superseded
+          # path below, which exits green. No `--cleanup-tag`: publishing is
+          # what cuts a tag, so a draft has none and deleting that ref is a 422.
+          published=false
+          trap '[ "$published" = true ] || gh release delete "$staged" --yes >/dev/null 2>&1 || true' EXIT
+
+          gh release create "$staged" --draft --target "$GITHUB_SHA" \
+            --title "$tag" --notes "Automated build of ${GITHUB_SHA:0:7}."
+          gh release upload "$staged" "${assets[@]}"
+
+          # Sizes, not just presence: an upload cut off partway still leaves a
+          # named asset behind, and a truncated binary is the one outcome this
+          # whole dance exists to keep off the download page.
+          sizes=$(gh release view "$staged" --json assets --jq '.assets[] | "\(.name) \(.size)"')
+          for asset in "${assets[@]}"; do
+            name=$(basename "$asset")
+            want=$(stat -c%s "$asset")
+            got=$(printf '%s\n' "$sizes" | awk -v n="$name" '$1 == n { print $2 }')
+            [ "$want" = "$got" ] || {
+              echo "$name uploaded as ${got:-nothing}, expected $want bytes" >&2
+              exit 1
+            }
+          done
+
+          # One moving pointer means order matters, and the concurrency group
+          # serializes these jobs without ordering them: a re-run of an older
+          # commit, or a build overtaken by a newer push, would otherwise walk
+          # `latest` backwards onto stale binaries. The race stays open until
+          # the swap, so this asks as late as it usefully can.
+          tip=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "superseded by $tip; leaving $tag as it is"
+            exit 0
+          fi
+
+          # Existence read out of a listing rather than a status code. `gh`
+          # exits non-zero on a 404 and `shell: bash` runs with `pipefail`, so
+          # pulling the code out of `gh api -i` kills the job at the
+          # assignment; and `view || skip` reads a rate limit or an expired
+          # token as "not there". Both queries below answer with data and a
+          # zero status when the thing is absent, so anything else stops the
+          # job here instead of being mistaken for absence.
+          #
+          # GitHub allows one release per tag, so the old release has to go
+          # before the draft can take its name, and `latest` resolves to
+          # nothing until the edit lands.
+          #
+          # The release and the tag come off in two calls because they go
+          # missing separately: a tag outlives its release when a cleanup was
+          # interrupted or a ref is protected, and a release outlives its tag
+          # when somebody deletes the tag by hand. `--cleanup-tag` would fold
+          # them into one round trip, but on a ref that is already gone it
+          # fails, and it fails having already deleted the release, which ends
+          # the job with `latest` taken down and nothing put back.
+          releases=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name')
+          if printf '%s\n' "$releases" | grep -qxF "$tag"; then
+            gh release delete "$tag" --yes
+          fi
+
+          # `target_commitish` is documented as unused when the tag already
+          # exists, so a tag left in place here would publish this build's
+          # assets under a name still pointing at an older commit, with nothing
+          # on the page saying so.
+          refs=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$tag" --jq '.[].ref')
+          if printf '%s\n' "$refs" | grep -qxF "refs/tags/$tag"; then
+            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$tag" --silent
+          fi
+
+          # `--target` is read only when the tag is cut, which is what the two
+          # deletes above are for.
+          gh release edit "$staged" --tag "$tag" --target "$GITHUB_SHA" --draft=false
+          published=true
+
+  # The avatar flow end to end, with the real model rather than a stub. It
+  # reads the gates' caches and saves none: a second build tree in cache
+  # storage for a weekly job would evict the one every pull request uses.
+  avatar:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # browser-check.sh builds the server, and webrtc-sys needs Clang 21+.
+      - name: Install system packages
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libglib2.0-dev mold
+      - name: Install WebRTC C++ compiler
+        uses: ./.github/actions/webrtc-clang
+      - name: Install Rust
+        run: rustup toolchain install
+      - name: Restore cargo cache
+        uses: ./.github/actions/restore-cargo-cache
+      - name: Report disk after restoring the build cache
+        run: df -h /
+      - name: Restore vendored bytes
+        uses: ./.github/actions/restore-vendor
+      - name: Install node dependencies
+        run: npm ci
+      - name: Install Chromium
+        uses: ./.github/actions/chromium
+      - name: Run the avatar browser check
+        env:
+          BROWSER_CHECK_FLOW: avatar
+          BROWSER_CHECK_REQUIRE_MODEL: 1
+        run: ./scripts/browser-check.sh
+      - name: Report disk after the browser check
+        if: always()
+        run: df -h /

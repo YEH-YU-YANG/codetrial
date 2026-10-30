@@ -1,0 +1,41 @@
+# Temporary: runs the Change keys unit tests on Windows, in this fork only.
+# It lives on the verify/ci-dry-run branch and is never merged.
+name: Verify Change keys on Windows
+
+on:
+  push:
+    branches: [verify/ci-dry-run]
+
+permissions:
+  contents: read
+
+jobs:
+  setup-edit:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      # The release job's flag for this target: WebRTC links the static CRT.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Kept when the tests fail too, so the next attempt does not rebuild
+          # the whole crate.
+          cache-on-failure: true
+      - name: Run the Change keys tests
+        shell: bash
+        # Reading a job log needs admin rights and an annotation does not, so
+        # a failure's key lines are repeated in one.
+        run: |
+          status=0
+          cargo test --locked --lib web::setup_edit 2>&1 | tee test.log || status=$?
+          if [ "$status" -ne 0 ]; then
+            lines=$({ grep -E '^error|^ +--> |^test .*(FAILED|ok)$|panicked at|^  left|^ right|^test result' test.log || true; } | head -80 | sed 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')
+            echo "::error title=cargo test failed::$lines"
+          fi
+          exit "$status"
