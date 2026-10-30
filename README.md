@@ -6,6 +6,8 @@
 
 ![Change keys at /setup on a configured server, with the LiveKit endpoint and whether a Google key is set, light and dark](img/after-setup.png)
 
+![The end of Change keys, where a save needs the code the server printed in its terminal, light and dark](img/after-code.png)
+
 ![Change keys after a save, with the restart notice every visit shows until the restart, light and dark](img/after-saved.png)
 
 The screenshots come from Chromium at a 1280x860 window, light and dark from
