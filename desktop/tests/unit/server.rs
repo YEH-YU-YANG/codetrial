@@ -128,11 +128,24 @@ fn an_exit_is_explained_by_what_the_server_last_wrote() {
 
 /// A stand-in server: a shell script, so the process handling is what is
 /// tested and not the CodeTrial server.
+///
+/// Copied into place by `cp` rather than written from here, as
+/// `write_executable` in tests/support.py does: the tests run on threads, a
+/// file one thread has open for writing stays open in any process another
+/// thread forks until that process execs, and starting the script in that
+/// window fails with "Text file busy".
 #[cfg(unix)]
 fn fake_server(dir: &Path, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let program = dir.join("fake-codetrial");
-    std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let source = dir.join("fake-codetrial.source");
+    std::fs::write(&source, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let copied = std::process::Command::new("cp")
+        .arg(&source)
+        .arg(&program)
+        .status()
+        .unwrap();
+    assert!(copied.success(), "cp {copied}");
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     program
 }
