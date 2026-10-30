@@ -8,11 +8,11 @@
 
 ![Show 21653471111312 pressed while the cube is still turning. Two seconds later the cube before this change ends on 12673452213311 with "Moves so far: R U R' U'", while the cube after it stays on 21653471111312](img/show-storyboard.png)
 
-The captures come from Chromium 156 at a 1280x1000 window on fdf3926 (main,
-before) and 66c07d8 (this change, after), in the task-workspace browser test
+The captures come from Chromium 156 at a 1280x1000 window on 3bbbcf5 (main,
+before) and c4797e5 (this change, after), in the task-workspace browser test
 harness with its stub task agent, camera and face detector and the cube
 explainer turned on. Each run types R U R' U', presses Apply, and clicks Reset
-or Show with the mouse 0.08 to 0.12 s later, while the first turn is still
+or Show with the mouse about 0.1 s later, while the first turn is still
 swinging, then takes a screenshot every 50 to 100 ms for 2.3 s. Each cell is
 cut from those screenshots: the cube, the algorithm row and the history line,
 and for Show also the position code and the Show row. The step headings, the
